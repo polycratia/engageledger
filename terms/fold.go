@@ -3,10 +3,16 @@
 // time-and-materials cap. A number moves only through a change order that both
 // the client and the contractor approved by naming the hash of the line the
 // proposal was written on, so proposed, declined and withdrawn change orders
-// are listed next to terms they left untouched. Fold names the first event it
-// refuses: a change order naming a milestone the contract does not carry, one
-// priced in another currency, one that removes or reprices an accepted
-// milestone, or a second decision on a settled change order.
+// are listed next to terms they left untouched. An approval may carry its
+// evidence: an ed25519 signature over the proposal body, checked against the
+// key contract.opened lists for the party, or the SHA-256 of a recorded proof
+// kept outside the journal, which is weaker because nothing here ties it to
+// the body it approves. Every effective change order reports the strength of
+// its evidence, and the terms carry the money that rests on weak evidence
+// alone. Fold names the first event it refuses: a change order naming a
+// milestone the contract does not carry, one priced in another currency, one
+// that removes or reprices an accepted milestone, a second decision on a
+// settled change order, or an approval whose evidence does not hold.
 package terms
 
 import (
@@ -16,6 +22,7 @@ import (
 	"slices"
 	"strconv"
 
+	"github.com/polycratia/engageledger/approval"
 	"github.com/polycratia/engageledger/journal"
 )
 
@@ -39,6 +46,21 @@ const (
 	StateEffective State = "effective"
 	StateDeclined  State = "declined"
 	StateWithdrawn State = "withdrawn"
+)
+
+// Strength is the weakest evidence any approval of an effective change order
+// rests on.
+type Strength string
+
+const (
+	// StrengthSigned means every approval verified as an ed25519 signature over
+	// the proposal body.
+	StrengthSigned Strength = "signed"
+	// StrengthRecorded means an approval named only the SHA-256 of evidence the
+	// journal does not hold.
+	StrengthRecorded Strength = "recorded"
+	// StrengthAsserted means an approval carried no evidence at all.
+	StrengthAsserted Strength = "asserted"
 )
 
 // OpKind is the move one change order op makes.
@@ -78,22 +100,31 @@ type Op struct {
 }
 
 // ChangeOrder is a proposal and what became of it. Hash is the journal line
-// the proposal was written on, which its approvals name.
+// the proposal was written on, which its approvals name. Strength and Delta
+// are filled in when the change order becomes effective: the weakest evidence
+// its approvals rest on and the move it made in the total price.
 type ChangeOrder struct {
 	Hash      string
 	Seq       int64
 	State     State
 	Ops       []Op
 	Approvals []string
+	Strength  Strength
+	Delta     int64
 	DecidedBy string
+
+	evidence Strength
 }
 
-// Terms are the current money terms of the engagement.
+// Terms are the current money terms of the engagement. WeakTotal is how much
+// of the money moved by effective change orders rests on evidence weaker than
+// an ed25519 signature, counted as the size of each such move.
 type Terms struct {
 	Parties      Parties
 	Currency     string
 	Milestones   []Milestone
 	Total        int64
+	WeakTotal    int64
 	Cap          int64
 	ChangeOrders []ChangeOrder
 }
@@ -113,7 +144,7 @@ func (e *Error) Error() string {
 // *Error naming the first event it refuses. An empty journal folds to empty
 // terms.
 func Fold(events []journal.Event) (Terms, error) {
-	f := folder{byHash: map[string]*ChangeOrder{}}
+	f := folder{byHash: map[string]*ChangeOrder{}, bodies: map[string]map[string]any{}}
 	for _, e := range events {
 		if err := f.apply(e); err != nil {
 			return Terms{}, &Error{Seq: e.Seq, Type: e.Type, Msg: err.Error()}
@@ -126,10 +157,12 @@ type folder struct {
 	opened     bool
 	parties    Parties
 	currency   string
+	keys       approval.Keys
 	milestones []Milestone
 	cap        int64
 	orders     []*ChangeOrder
 	byHash     map[string]*ChangeOrder
+	bodies     map[string]map[string]any
 }
 
 func (f *folder) apply(e journal.Event) error {
@@ -178,8 +211,18 @@ func (f *folder) open(e journal.Event) error {
 			return err
 		}
 	}
+	keys, err := approval.ReadKeys(e.Body)
+	if err != nil {
+		return err
+	}
+	for party := range keys {
+		if party != parties.Client && party != parties.Contractor {
+			return fmt.Errorf("lists a key for %q, who is neither %q nor %q", party, parties.Client, parties.Contractor)
+		}
+	}
 	f.opened = true
-	f.parties, f.currency, f.milestones, f.cap = parties, currency, milestones, capAmount
+	f.parties, f.currency, f.keys = parties, currency, keys
+	f.milestones, f.cap = milestones, capAmount
 	return nil
 }
 
@@ -204,9 +247,10 @@ func (f *folder) propose(e journal.Event) error {
 	if _, _, err := applyOps(ops, f.milestones, f.cap); err != nil {
 		return err
 	}
-	co := &ChangeOrder{Hash: e.Hash, Seq: e.Seq, State: StateProposed, Ops: ops}
+	co := &ChangeOrder{Hash: e.Hash, Seq: e.Seq, State: StateProposed, Ops: ops, evidence: StrengthSigned}
 	f.orders = append(f.orders, co)
 	f.byHash[e.Hash] = co
+	f.bodies[e.Hash] = e.Body
 	return nil
 }
 
@@ -215,10 +259,17 @@ func (f *folder) approve(e journal.Event) error {
 	if err != nil {
 		return err
 	}
+	strength, err := f.evidence(e, co, by)
+	if err != nil {
+		return err
+	}
 	if slices.Contains(co.Approvals, by) {
 		return fmt.Errorf("repeats the approval of %q on change order %s", by, short(co.Hash))
 	}
 	co.Approvals = append(co.Approvals, by)
+	if rank(strength) < rank(co.evidence) {
+		co.evidence = strength
+	}
 	if len(co.Approvals) < 2 {
 		return nil
 	}
@@ -226,8 +277,32 @@ func (f *folder) approve(e journal.Event) error {
 	if err != nil {
 		return err
 	}
-	f.milestones, f.cap, co.State = milestones, capAmount, StateEffective
+	before := totalOf(f.milestones)
+	f.milestones, f.cap = milestones, capAmount
+	co.State, co.Strength, co.Delta = StateEffective, co.evidence, totalOf(milestones)-before
 	return nil
+}
+
+// evidence reads what an approval rests on. An approval that carries no
+// approval object is only asserted: the journal holds nothing to check.
+func (f *folder) evidence(e journal.Event, co *ChangeOrder, by string) (Strength, error) {
+	if _, ok := e.Body["approval"]; !ok {
+		return StrengthAsserted, nil
+	}
+	a, err := approval.Read(e.Body)
+	if err != nil {
+		return "", err
+	}
+	if a.Party != by {
+		return "", fmt.Errorf("carries an approval by %q on an event signed by %q", a.Party, by)
+	}
+	if err := approval.Verify(a, f.bodies[co.Hash], f.keys); err != nil {
+		return "", fmt.Errorf("carries an approval that %w", err)
+	}
+	if a.Strong() {
+		return StrengthSigned, nil
+	}
+	return StrengthRecorded, nil
 }
 
 func (f *folder) settle(e journal.Event, state State) error {
@@ -284,13 +359,39 @@ func (f *folder) terms() Terms {
 		Milestones: slices.Clone(f.milestones),
 		Cap:        f.cap,
 	}
-	for _, m := range t.Milestones {
-		t.Total += m.Amount
-	}
+	t.Total = totalOf(t.Milestones)
 	for _, co := range f.orders {
 		t.ChangeOrders = append(t.ChangeOrders, *co)
+		if co.State == StateEffective && co.Strength != StrengthSigned {
+			t.WeakTotal += size(co.Delta)
+		}
 	}
 	return t
+}
+
+func rank(s Strength) int {
+	switch s {
+	case StrengthSigned:
+		return 2
+	case StrengthRecorded:
+		return 1
+	}
+	return 0
+}
+
+func totalOf(milestones []Milestone) int64 {
+	var sum int64
+	for _, m := range milestones {
+		sum += m.Amount
+	}
+	return sum
+}
+
+func size(n int64) int64 {
+	if n < 0 {
+		return -n
+	}
+	return n
 }
 
 func applyOps(ops []Op, milestones []Milestone, capAmount int64) ([]Milestone, int64, error) {
