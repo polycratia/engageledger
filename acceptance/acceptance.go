@@ -7,9 +7,13 @@
 // it as refused and the milestone stays delivered with its clock running. A
 // valid rejection closes the window, and a later delivery opens a retest
 // window that restarts on the full term or resumes the days the closed one
-// had left, as the contract head asks. The business-day calendar is not here
-// yet: a window counts days, and the move to deemed_accepted takes the
-// deadline the clock computes.
+// had left, as the contract head asks. A delivery fixes the end of its window
+// as one UTC instant: milestone.delivered carries the deadline the
+// business-day calendar of the contract head computes and the hash of the
+// calendar it was computed on, and a delivery that carries neither, one
+// computed on another calendar, or one whose deadline is not the instant that
+// calendar fixes is refused. Deem closes a window once that instant has
+// passed.
 package acceptance
 
 import (
@@ -18,7 +22,9 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"time"
 
+	"github.com/polycratia/engageledger/bizday"
 	"github.com/polycratia/engageledger/journal"
 )
 
@@ -60,18 +66,20 @@ type Defect struct {
 }
 
 // Window is one acceptance window: the delivery that opened it, the business
-// days it runs and what closed it. Used is the days the clock had counted when
-// a rejection closed it, ClosedBy is the event that closed it, and Deadline is
-// the business day the clock named when the window ran out instead.
+// days it runs and what closed it. Delivered and Deadline are the UTC instants
+// the delivery arrived and the window runs out on, Used is the days the clock
+// had counted when a rejection closed it, and ClosedBy is the event that
+// closed it.
 type Window struct {
-	Seq      int64
-	Days     int64
-	Used     int64
-	Retest   bool
-	Closed   bool
-	ClosedBy int64
-	Deadline string
-	Defects  []Defect
+	Seq       int64
+	Days      int64
+	Used      int64
+	Retest    bool
+	Closed    bool
+	ClosedBy  int64
+	Delivered time.Time
+	Deadline  time.Time
+	Defects   []Defect
 }
 
 // Remaining is the days the window still had when it closed.
@@ -122,10 +130,13 @@ func (r Refusal) String() string {
 }
 
 // Acceptance is the acceptance state of the engagement. WindowDays and
-// RetestWindow are the acceptance config the contract head carries.
+// RetestWindow are the acceptance config the contract head carries, and
+// Calendar with CalendarHash is the business-day calendar it opened on.
 type Acceptance struct {
 	WindowDays   int64
 	RetestWindow Retest
+	Calendar     bizday.Calendar
+	CalendarHash string
 	Milestones   []Milestone
 	Refused      []Refusal
 }
@@ -139,29 +150,67 @@ func (a Acceptance) Find(id string) (Milestone, bool) {
 	return a.Milestones[i], true
 }
 
-// Deem moves a milestone to deemed_accepted because its open window ran out on
-// deadline, the business day the clock computes from the days the window runs.
+// Deem moves a milestone to deemed_accepted because the acceptance window its
+// delivery opened has run out: the deadline that delivery fixed is before at.
 // It refuses a milestone the contract does not carry, one with no open window,
-// and a contract that sets no acceptance window at all.
-func (a *Acceptance) Deem(id, deadline string) error {
-	if deadline == "" {
-		return errors.New("acceptance: the deadline the window ran out on must not be empty")
-	}
-	if a.WindowDays <= 0 {
-		return errors.New("acceptance: the contract sets no acceptance window, so no milestone is deemed accepted")
-	}
+// a window whose delivery fixed no deadline, and a deadline that has not
+// passed yet.
+func (a *Acceptance) Deem(id string, at time.Time) error {
 	i := indexOf(a.Milestones, id)
 	if i < 0 {
 		return fmt.Errorf("acceptance: milestone %q is not in the contract", id)
 	}
 	m := &a.Milestones[i]
-	if _, open := m.Open(); !open {
+	w, open := m.Open()
+	if !open {
 		return fmt.Errorf("acceptance: milestone %q is %s, with no open acceptance window", id, m.describe())
 	}
+	if w.Deadline.IsZero() {
+		return fmt.Errorf("acceptance: the delivery of milestone %q fixed no deadline, so no window of it runs out", id)
+	}
+	if !at.After(w.Deadline) {
+		return fmt.Errorf("acceptance: the acceptance window of milestone %q runs until %s, which has not passed at %s",
+			id, w.Deadline.Format(time.RFC3339), at.UTC().Format(time.RFC3339))
+	}
 	m.Status = StatusDeemedAccepted
-	w := &m.Windows[len(m.Windows)-1]
-	w.Closed, w.Deadline = true, deadline
+	m.Windows[len(m.Windows)-1].Closed = true
 	return nil
+}
+
+// DeliveryBody is the milestone.delivered body of a delivery of id at
+// deliveredAt that opens a window of days business days: the instant it
+// arrived, the UTC instant the window runs out on and the hash of the calendar
+// that instant was computed on.
+func DeliveryBody(cal bizday.Calendar, id string, deliveredAt time.Time, days int64) (map[string]any, error) {
+	if id == "" {
+		return nil, errors.New("acceptance: a delivery must name its milestone")
+	}
+	at := deliveredAt.UTC().Truncate(time.Second)
+	deadline, err := cal.Deadline(at, days)
+	if err != nil {
+		return nil, err
+	}
+	hash, err := cal.Hash()
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"milestone":     id,
+		"at":            at.Format(time.RFC3339),
+		"deadline_utc":  deadline.Format(time.RFC3339),
+		"calendar_hash": hash,
+	}, nil
+}
+
+// Deliver appends the milestone.delivered event of a delivery of id at
+// deliveredAt. A calendar that cannot fix the deadline leaves the journal
+// untouched.
+func Deliver(a *journal.Appender, cal bizday.Calendar, id string, deliveredAt time.Time, days int64) (journal.Event, error) {
+	body, err := DeliveryBody(cal, id, deliveredAt, days)
+	if err != nil {
+		return journal.Event{}, err
+	}
+	return a.Append(EventDelivered, body)
 }
 
 // Fold reads the events in order and returns the acceptance state they add up
@@ -178,6 +227,8 @@ func Fold(events []journal.Event) Acceptance {
 	return Acceptance{
 		WindowDays:   f.window,
 		RetestWindow: f.retest,
+		Calendar:     f.calendar,
+		CalendarHash: f.hash,
 		Milestones:   f.milestones,
 		Refused:      f.refused,
 	}
@@ -187,6 +238,8 @@ type folder struct {
 	opened     bool
 	window     int64
 	retest     Retest
+	calendar   bizday.Calendar
+	hash       string
 	milestones []Milestone
 	refused    []Refusal
 }
@@ -227,8 +280,21 @@ func (f *folder) open(e journal.Event) error {
 	if err != nil {
 		return err
 	}
+	var calendar bizday.Calendar
+	hash := ""
+	if _, ok := e.Body["calendar"]; ok {
+		if calendar, err = bizday.Read(e.Body); err != nil {
+			return err
+		}
+		if hash, err = calendar.Hash(); err != nil {
+			return err
+		}
+	} else if window > 0 {
+		return fmt.Errorf("sets an acceptance window of %d business days but carries no calendar to count them on", window)
+	}
 	f.opened, f.milestones = true, milestones
 	f.window, f.retest = window, retest
+	f.calendar, f.hash = calendar, hash
 	return nil
 }
 
@@ -261,8 +327,50 @@ func (f *folder) deliver(e journal.Event, i int) error {
 			w.Days = m.Windows[len(m.Windows)-1].Remaining()
 		}
 	}
+	if err := f.fix(&w, e.Body); err != nil {
+		return err
+	}
 	m.Status = StatusDelivered
 	m.Windows = append(m.Windows, w)
+	return nil
+}
+
+// fix reads the deadline a delivery fixed and checks it against the calendar
+// the contract opened on, so a replay deems acceptance on the instant the
+// delivery named rather than on one it recomputes elsewhere.
+func (f *folder) fix(w *Window, body map[string]any) error {
+	if f.hash == "" {
+		for _, key := range []string{"at", "deadline_utc", "calendar_hash"} {
+			if _, ok := body[key]; ok {
+				return fmt.Errorf("carries %s under a contract that opened on no calendar", key)
+			}
+		}
+		return nil
+	}
+	hash, err := readText(body, "calendar_hash")
+	if err != nil {
+		return err
+	}
+	if hash != f.hash {
+		return fmt.Errorf("was computed on calendar %s, but the contract opened on %s", short(hash), short(f.hash))
+	}
+	at, err := readInstant(body, "at")
+	if err != nil {
+		return err
+	}
+	deadline, err := readInstant(body, "deadline_utc")
+	if err != nil {
+		return err
+	}
+	want, err := f.calendar.Deadline(at, w.Days)
+	if err != nil {
+		return err
+	}
+	if !deadline.Equal(want) {
+		return fmt.Errorf("fixes deadline %s, but the %d-business-day window from %s on that calendar closes at %s",
+			deadline.Format(time.RFC3339), w.Days, at.Format(time.RFC3339), want.Format(time.RFC3339))
+	}
+	w.Delivered, w.Deadline = at, deadline
 	return nil
 }
 
@@ -428,6 +536,18 @@ func readText(m map[string]any, key string) (string, error) {
 	return s, nil
 }
 
+func readInstant(m map[string]any, key string) (time.Time, error) {
+	s, err := readText(m, key)
+	if err != nil {
+		return time.Time{}, err
+	}
+	at, err := time.Parse(time.RFC3339, s)
+	if err != nil || at.UTC().Format(time.RFC3339) != s {
+		return time.Time{}, fmt.Errorf("has a %s that is not an RFC 3339 UTC instant: %q", key, s)
+	}
+	return at.UTC(), nil
+}
+
 func readCount(v any, key string) (int64, error) {
 	var n int64
 	switch t := v.(type) {
@@ -452,4 +572,11 @@ func readCount(v any, key string) (int64, error) {
 
 func indexOf(milestones []Milestone, id string) int {
 	return slices.IndexFunc(milestones, func(m Milestone) bool { return m.ID == id })
+}
+
+func short(hash string) string {
+	if len(hash) > 12 {
+		return hash[:12]
+	}
+	return hash
 }
