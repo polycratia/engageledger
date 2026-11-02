@@ -6,17 +6,22 @@
 // defect note; a rejection that names none fails no criterion, so Fold lists
 // it as refused and the milestone stays delivered with its clock running. A
 // valid rejection closes the window, and a later delivery opens a retest
-// window that restarts on the full term or resumes the days the closed one
-// had left, as the contract head asks. A delivery fixes the end of its window
-// as one UTC instant: milestone.delivered carries the deadline the
-// business-day calendar of the contract head computes and the hash of the
-// calendar it was computed on, and a delivery that carries neither, one
-// computed on another calendar, or one whose deadline is not the instant that
-// calendar fixes is refused. Deem closes a window once that instant has
+// window that restarts on the full term or resumes the days the closed one had
+// left, as the contract head asks. A delivery fixes the end of its window as
+// one UTC instant: milestone.delivered carries the deadline the business-day
+// calendar it names computes and the hash of that calendar, and the fold takes
+// that instant as recorded, so nothing recomputed later moves a deadline the
+// journal already holds. Verify reads every recorded deadline against the
+// calendar version whose hash its delivery names and reports the drifts it
+// finds instead of applying them. A calendar.revised event appends another
+// calendar version, which the deliveries recorded after it count on; a
+// delivery naming a calendar the journal never appended, or one a revision
+// superseded, is refused. Deem closes a window once the recorded instant has
 // passed.
 package acceptance
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +37,7 @@ import (
 // through.
 const (
 	EventOpened    = "contract.opened"
+	EventRevised   = "calendar.revised"
 	EventDelivered = "milestone.delivered"
 	EventAccepted  = "milestone.accepted"
 	EventRejected  = "milestone.rejected"
@@ -67,19 +73,20 @@ type Defect struct {
 
 // Window is one acceptance window: the delivery that opened it, the business
 // days it runs and what closed it. Delivered and Deadline are the UTC instants
-// the delivery arrived and the window runs out on, Used is the days the clock
-// had counted when a rejection closed it, and ClosedBy is the event that
-// closed it.
+// the delivery arrived and the window runs out on, CalendarHash names the
+// calendar version they were computed on, Used is the days the clock had
+// counted when a rejection closed it, and ClosedBy is the event that closed it.
 type Window struct {
-	Seq       int64
-	Days      int64
-	Used      int64
-	Retest    bool
-	Closed    bool
-	ClosedBy  int64
-	Delivered time.Time
-	Deadline  time.Time
-	Defects   []Defect
+	Seq          int64
+	Days         int64
+	Used         int64
+	Retest       bool
+	Closed       bool
+	ClosedBy     int64
+	Delivered    time.Time
+	Deadline     time.Time
+	CalendarHash string
+	Defects      []Defect
 }
 
 // Remaining is the days the window still had when it closed.
@@ -129,14 +136,59 @@ func (r Refusal) String() string {
 	return "event " + strconv.FormatInt(r.Seq, 10) + " " + r.Type + ": " + r.Msg
 }
 
+// Version is one business-day calendar the journal appended, the event that
+// appended it and the hash a delivery names it by. The deliveries recorded
+// after that event count on it; the windows opened before it keep the version
+// their delivery named.
+type Version struct {
+	Seq      int64
+	Hash     string
+	Calendar bizday.Calendar
+}
+
+// Cause names where a drift between a recorded deadline and the one a replay
+// recomputes comes from.
+type Cause string
+
+const (
+	// CauseTzdata is a drift that keeps the day the window closes on and moves
+	// only the instant of that close: the calendar is the one the delivery names,
+	// byte for byte, so the zone database is what reads it differently.
+	CauseTzdata Cause = "tzdata"
+	// CauseCalendar is a drift that moves the day the window closes on, which the
+	// calendar the delivery names does not fix: the recorded instant was computed
+	// on another calendar or another term.
+	CauseCalendar Cause = "calendar"
+)
+
+// Drift is one recorded deadline a replay recomputes to another instant.
+// Recorded is the instant the fold uses and Recomputed is the one the calendar
+// the delivery names fixes on this replay, which nothing writes back.
+type Drift struct {
+	Seq        int64
+	Milestone  string
+	Recorded   time.Time
+	Recomputed time.Time
+	Cause      Cause
+}
+
+func (d Drift) String() string {
+	return "delivery " + strconv.FormatInt(d.Seq, 10) + " of " + d.Milestone +
+		" records " + d.Recorded.Format(time.RFC3339) +
+		", this replay computes " + d.Recomputed.Format(time.RFC3339) +
+		" (" + string(d.Cause) + ")"
+}
+
 // Acceptance is the acceptance state of the engagement. WindowDays and
-// RetestWindow are the acceptance config the contract head carries, and
-// Calendar with CalendarHash is the business-day calendar it opened on.
+// RetestWindow are the acceptance config the contract head carries, Calendars
+// are the calendar versions the journal appended in order, and Calendar with
+// CalendarHash is the one the last of them put in force.
 type Acceptance struct {
 	WindowDays   int64
 	RetestWindow Retest
 	Calendar     bizday.Calendar
 	CalendarHash string
+	Calendars    []Version
 	Milestones   []Milestone
 	Refused      []Refusal
 }
@@ -150,11 +202,59 @@ func (a Acceptance) Find(id string) (Milestone, bool) {
 	return a.Milestones[i], true
 }
 
+// Verify recomputes every recorded deadline with the calendar version whose
+// hash its delivery names and returns the ones that come out on another
+// instant, in journal order. A drift is reported, never applied: the windows
+// keep the deadline their delivery recorded, so neither a revised calendar nor
+// an updated zone database moves a window that is already running.
+func (a Acceptance) Verify() ([]Drift, error) {
+	var drifts []Drift
+	for _, m := range a.Milestones {
+		for _, w := range m.Windows {
+			if w.Deadline.IsZero() {
+				continue
+			}
+			v, ok := versionOf(a.Calendars, w.CalendarHash)
+			if !ok {
+				return nil, fmt.Errorf("acceptance: delivery %d of milestone %q names calendar %s, which the journal does not carry",
+					w.Seq, m.ID, short(w.CalendarHash))
+			}
+			want, err := v.Calendar.Deadline(w.Delivered, w.Days)
+			if err != nil {
+				return nil, fmt.Errorf("acceptance: recomputing the deadline of delivery %d of milestone %q: %w", w.Seq, m.ID, err)
+			}
+			if want.Equal(w.Deadline) {
+				continue
+			}
+			drifts = append(drifts, Drift{
+				Seq:        w.Seq,
+				Milestone:  m.ID,
+				Recorded:   w.Deadline,
+				Recomputed: want,
+				Cause:      causeOf(v.Calendar, w.Deadline, want),
+			})
+		}
+	}
+	slices.SortFunc(drifts, func(x, y Drift) int { return cmp.Compare(x.Seq, y.Seq) })
+	return drifts, nil
+}
+
+// causeOf reads a drift as the zone database moving under one unchanged
+// calendar while both instants fall on the same day in its zone, and as
+// another calendar once the day itself moves.
+func causeOf(cal bizday.Calendar, recorded, recomputed time.Time) Cause {
+	loc, err := time.LoadLocation(cal.Zone)
+	if err != nil || recorded.In(loc).Format(time.DateOnly) != recomputed.In(loc).Format(time.DateOnly) {
+		return CauseCalendar
+	}
+	return CauseTzdata
+}
+
 // Deem moves a milestone to deemed_accepted because the acceptance window its
-// delivery opened has run out: the deadline that delivery fixed is before at.
-// It refuses a milestone the contract does not carry, one with no open window,
-// a window whose delivery fixed no deadline, and a deadline that has not
-// passed yet.
+// delivery opened has run out: the deadline that delivery recorded is before
+// at. It refuses a milestone the contract does not carry, one with no open
+// window, a window whose delivery fixed no deadline, and a deadline that has
+// not passed yet.
 func (a *Acceptance) Deem(id string, at time.Time) error {
 	i := indexOf(a.Milestones, id)
 	if i < 0 {
@@ -213,6 +313,12 @@ func Deliver(a *journal.Appender, cal bizday.Calendar, id string, deliveredAt ti
 	return a.Append(EventDelivered, body)
 }
 
+// ReviseBody is the calendar.revised body that puts cal in force for the
+// deliveries recorded after it.
+func ReviseBody(cal bizday.Calendar) map[string]any {
+	return map[string]any{"calendar": cal.Object()}
+}
+
 // Fold reads the events in order and returns the acceptance state they add up
 // to. Unlike the fold that prices the engagement, a refused event does not
 // stop it: the event is listed in Refused and the milestones keep the state
@@ -224,36 +330,49 @@ func Fold(events []journal.Event) Acceptance {
 			f.refused = append(f.refused, Refusal{Seq: e.Seq, Type: e.Type, Msg: err.Error()})
 		}
 	}
-	return Acceptance{
+	a := Acceptance{
 		WindowDays:   f.window,
 		RetestWindow: f.retest,
-		Calendar:     f.calendar,
-		CalendarHash: f.hash,
+		Calendars:    f.calendars,
 		Milestones:   f.milestones,
 		Refused:      f.refused,
 	}
+	if head, ok := f.head(); ok {
+		a.Calendar, a.CalendarHash = head.Calendar, head.Hash
+	}
+	return a
 }
 
 type folder struct {
 	opened     bool
 	window     int64
 	retest     Retest
-	calendar   bizday.Calendar
-	hash       string
+	calendars  []Version
 	milestones []Milestone
 	refused    []Refusal
+}
+
+// head is the calendar version in force where the fold stands.
+func (f *folder) head() (Version, bool) {
+	if len(f.calendars) == 0 {
+		return Version{}, false
+	}
+	return f.calendars[len(f.calendars)-1], true
 }
 
 func (f *folder) apply(e journal.Event) error {
 	switch e.Type {
 	case EventOpened:
 		return f.open(e)
-	case EventDelivered, EventAccepted, EventRejected:
+	case EventRevised, EventDelivered, EventAccepted, EventRejected:
 	default:
 		return nil
 	}
 	if !f.opened {
 		return errors.New("arrives before contract.opened")
+	}
+	if e.Type == EventRevised {
+		return f.revise(e)
 	}
 	i, err := f.locate(e)
 	if err != nil {
@@ -280,22 +399,60 @@ func (f *folder) open(e journal.Event) error {
 	if err != nil {
 		return err
 	}
-	var calendar bizday.Calendar
-	hash := ""
+	var calendars []Version
 	if _, ok := e.Body["calendar"]; ok {
-		if calendar, err = bizday.Read(e.Body); err != nil {
+		v, err := readVersion(e)
+		if err != nil {
 			return err
 		}
-		if hash, err = calendar.Hash(); err != nil {
-			return err
-		}
+		calendars = []Version{v}
 	} else if window > 0 {
 		return fmt.Errorf("sets an acceptance window of %d business days but carries no calendar to count them on", window)
 	}
 	f.opened, f.milestones = true, milestones
 	f.window, f.retest = window, retest
-	f.calendar, f.hash = calendar, hash
+	f.calendars = calendars
 	return nil
+}
+
+// revise appends the calendar version an event carries. The versions before it
+// stay in the fold: the deadlines they fixed are the ones their windows keep,
+// and a replay reads them back on the version their delivery named.
+func (f *folder) revise(e journal.Event) error {
+	head, ok := f.head()
+	if !ok {
+		return errors.New("revises the calendar of a contract that opened on none")
+	}
+	v, err := readVersion(e)
+	if err != nil {
+		return err
+	}
+	if seen, ok := versionOf(f.calendars, v.Hash); ok {
+		return fmt.Errorf("appends calendar %s again, which event %d already carries", short(v.Hash), seen.Seq)
+	}
+	_ = head
+	f.calendars = append(f.calendars, v)
+	return nil
+}
+
+func readVersion(e journal.Event) (Version, error) {
+	cal, err := bizday.Read(e.Body)
+	if err != nil {
+		return Version{}, err
+	}
+	hash, err := cal.Hash()
+	if err != nil {
+		return Version{}, err
+	}
+	return Version{Seq: e.Seq, Hash: hash, Calendar: cal}, nil
+}
+
+func versionOf(versions []Version, hash string) (Version, bool) {
+	i := slices.IndexFunc(versions, func(v Version) bool { return v.Hash == hash })
+	if i < 0 {
+		return Version{}, false
+	}
+	return versions[i], true
 }
 
 // locate finds the milestone an event names and refuses every event that
@@ -335,13 +492,17 @@ func (f *folder) deliver(e journal.Event, i int) error {
 	return nil
 }
 
-// fix reads the deadline a delivery fixed and checks it against the calendar
-// the contract opened on, so a replay deems acceptance on the instant the
-// delivery named rather than on one it recomputes elsewhere.
+// fix reads the deadline a delivery recorded and the calendar version it counts
+// on, which must be the one in force where the delivery stands. The instant
+// enters the window as recorded: nothing here recomputes it, so a revised
+// calendar or an updated zone database cannot move a deadline the journal
+// already carries. Verify is what reports a recorded deadline this replay
+// would compute elsewhere.
 func (f *folder) fix(w *Window, body map[string]any) error {
-	if f.hash == "" {
+	head, ok := f.head()
+	if !ok {
 		for _, key := range []string{"at", "deadline_utc", "calendar_hash"} {
-			if _, ok := body[key]; ok {
+			if _, carries := body[key]; carries {
 				return fmt.Errorf("carries %s under a contract that opened on no calendar", key)
 			}
 		}
@@ -351,8 +512,12 @@ func (f *folder) fix(w *Window, body map[string]any) error {
 	if err != nil {
 		return err
 	}
-	if hash != f.hash {
-		return fmt.Errorf("was computed on calendar %s, but the contract opened on %s", short(hash), short(f.hash))
+	if hash != head.Hash {
+		if old, known := versionOf(f.calendars, hash); known {
+			return fmt.Errorf("counts on calendar %s, which the revision at event %d superseded with %s",
+				short(old.Hash), head.Seq, short(head.Hash))
+		}
+		return fmt.Errorf("names calendar %s, which no contract.opened or calendar.revised before it appended", short(hash))
 	}
 	at, err := readInstant(body, "at")
 	if err != nil {
@@ -362,15 +527,7 @@ func (f *folder) fix(w *Window, body map[string]any) error {
 	if err != nil {
 		return err
 	}
-	want, err := f.calendar.Deadline(at, w.Days)
-	if err != nil {
-		return err
-	}
-	if !deadline.Equal(want) {
-		return fmt.Errorf("fixes deadline %s, but the %d-business-day window from %s on that calendar closes at %s",
-			deadline.Format(time.RFC3339), w.Days, at.Format(time.RFC3339), want.Format(time.RFC3339))
-	}
-	w.Delivered, w.Deadline = at, deadline
+	w.Delivered, w.Deadline, w.CalendarHash = at, deadline, hash
 	return nil
 }
 

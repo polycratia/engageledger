@@ -127,6 +127,8 @@ func deliver(t *testing.T, id, stamp string, days int64) step {
 	return deliveryOn(t, cal, id, stamp, days)
 }
 
+func revise(c bizday.Calendar) step { return step{EventRevised, ReviseBody(c)} }
+
 // bareDelivery names only its milestone, which is all an event refused before
 // its deadline is read needs to carry.
 func bareDelivery(id string) step {
@@ -149,6 +151,27 @@ func defect(criterion, note string) map[string]any {
 	return map[string]any{"criterion": criterion, "note": note}
 }
 
+func copyBody(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+// offsetBy moves the deadline a delivery recorded by d, which stands in for an
+// instant computed against another zone database or another calendar.
+func offsetBy(t *testing.T, s step, d time.Duration) step {
+	t.Helper()
+	recorded, err := time.Parse(time.RFC3339, s.body["deadline_utc"].(string))
+	if err != nil {
+		t.Fatalf("parsing the recorded deadline: %v", err)
+	}
+	body := copyBody(s.body)
+	body["deadline_utc"] = recorded.Add(d).UTC().Format(time.RFC3339)
+	return step{EventDelivered, body}
+}
+
 func milestoneOf(t *testing.T, a Acceptance, id string) Milestone {
 	t.Helper()
 	m, ok := a.Find(id)
@@ -167,6 +190,15 @@ func hashOf(t *testing.T, c bizday.Calendar) string {
 	return hash
 }
 
+func driftsOf(t *testing.T, a Acceptance) []Drift {
+	t.Helper()
+	drifts, err := a.Verify()
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	return drifts
+}
+
 func TestDeliveryFixesTheDeadlineAndAcceptanceClosesTheWindow(t *testing.T) {
 	got := fold(t, head(config(10, RetestRestart)), deliver(t, "m2", deliveredAt, 10), accept("m2"))
 	if len(got.Refused) != 0 {
@@ -177,6 +209,9 @@ func TestDeliveryFixesTheDeadlineAndAcceptanceClosesTheWindow(t *testing.T) {
 	}
 	if got.CalendarHash != hashOf(t, cal) || got.Calendar.Zone != zone {
 		t.Errorf("calendar = %+v with hash %q, want the one the head carries", got.Calendar, got.CalendarHash)
+	}
+	if len(got.Calendars) != 1 || got.Calendars[0].Seq != 1 {
+		t.Errorf("calendar versions = %+v, want the one the head opened on", got.Calendars)
 	}
 	m := milestoneOf(t, got, "m2")
 	if m.Status != StatusAccepted {
@@ -198,6 +233,12 @@ func TestDeliveryFixesTheDeadlineAndAcceptanceClosesTheWindow(t *testing.T) {
 	if stamp := w.Delivered.Format(time.RFC3339); stamp != wantDelivery {
 		t.Errorf("delivered at %s, want %s", stamp, wantDelivery)
 	}
+	if w.CalendarHash != hashOf(t, cal) {
+		t.Errorf("the window counts on %q, want the calendar its delivery named", w.CalendarHash)
+	}
+	if drifts := driftsOf(t, got); len(drifts) != 0 {
+		t.Errorf("Verify reported %v on a deadline that calendar fixes", drifts)
+	}
 	if _, open := m.Open(); open {
 		t.Error("the window is still open after an acceptance")
 	}
@@ -209,20 +250,13 @@ func TestDeliveryFixesTheDeadlineAndAcceptanceClosesTheWindow(t *testing.T) {
 func TestADeliveryThatFixesNoDeadlineIsRefused(t *testing.T) {
 	ten := func() map[string]any { return head(config(10, RetestRestart)) }
 	good := deliver(t, "m2", deliveredAt, 10)
-	copied := func() map[string]any {
-		body := make(map[string]any, len(good.body))
-		for k, v := range good.body {
-			body[k] = v
-		}
-		return body
-	}
 	without := func(key string) step {
-		body := copied()
+		body := copyBody(good.body)
 		delete(body, key)
 		return step{EventDelivered, body}
 	}
 	changed := func(key string, v any) step {
-		body := copied()
+		body := copyBody(good.body)
 		body[key] = v
 		return step{EventDelivered, body}
 	}
@@ -236,13 +270,12 @@ func TestADeliveryThatFixesNoDeadlineIsRefused(t *testing.T) {
 		{"a delivery fixing no deadline", ten(), without("deadline_utc"), "no deadline_utc string"},
 		{"a delivery that does not say when it arrived", ten(), without("at"), "no at string"},
 		{
-			"a delivery computed on another calendar",
-			ten(), deliveryOn(t, newCalendar("2026-03-16"), "m2", deliveredAt, 10), "the contract opened on",
+			"a delivery counted on a calendar the journal never appended",
+			ten(), deliveryOn(t, newCalendar("2026-03-16"), "m2", deliveredAt, 10),
+			"no contract.opened or calendar.revised",
 		},
-		{"a deadline the calendar does not fix", ten(), changed("deadline_utc", "2026-03-17T16:00:00Z"), "closes at"},
 		{"a deadline that is not in UTC", ten(), changed("deadline_utc", "2026-03-16T17:00:00+01:00"), "RFC 3339 UTC instant"},
 		{"a deadline that is not an instant", ten(), changed("deadline_utc", "2026-03-16"), "RFC 3339 UTC instant"},
-		{"a deadline counted on another term", head(config(5, RetestRestart)), good, "closes at"},
 		{"a deadline under a head that opened on no calendar", headOn(nil, nil), good, "no calendar"},
 	}
 	for _, c := range cases {
@@ -260,6 +293,133 @@ func TestADeliveryThatFixesNoDeadlineIsRefused(t *testing.T) {
 			}
 			if m := milestoneOf(t, got, "m2"); m.Status != "" || len(m.Windows) != 0 {
 				t.Errorf("a refused delivery left milestone %+v", m)
+			}
+		})
+	}
+}
+
+func TestARevisedCalendarLeavesARecordedDeadlineWhereItIs(t *testing.T) {
+	revised := newCalendar("2026-03-16")
+	got := fold(t, head(config(10, RetestRestart)),
+		deliver(t, "m2", deliveredAt, 10),
+		revise(revised),
+		deliveryOn(t, revised, "m1", deliveredAt, 10))
+	if len(got.Refused) != 0 {
+		t.Fatalf("the fold refused %v", got.Refused)
+	}
+	if got.CalendarHash != hashOf(t, revised) {
+		t.Errorf("the contract counts on %q, want the revised calendar", got.CalendarHash)
+	}
+	if len(got.Calendars) != 2 || got.Calendars[0].Hash != hashOf(t, cal) || got.Calendars[1].Seq != 3 {
+		t.Errorf("calendar versions = %+v, want the head calendar and the revision at seq 3", got.Calendars)
+	}
+	held, open := milestoneOf(t, got, "m2").Open()
+	if !open {
+		t.Fatal("the delivery opened no acceptance window")
+	}
+	if stamp := held.Deadline.Format(time.RFC3339); stamp != wantDeadline {
+		t.Errorf("the recorded deadline moved to %s, want it held at %s", stamp, wantDeadline)
+	}
+	if held.CalendarHash != hashOf(t, cal) {
+		t.Errorf("the window counts on %q, want the calendar version its delivery named", held.CalendarHash)
+	}
+	later, open := milestoneOf(t, got, "m1").Open()
+	if !open {
+		t.Fatal("the delivery after the revision opened no acceptance window")
+	}
+	if stamp := later.Deadline.Format(time.RFC3339); stamp != "2026-03-17T16:00:00Z" {
+		t.Errorf("the delivery after the revision runs to %s, want the new holiday skipped", stamp)
+	}
+	if drifts := driftsOf(t, got); len(drifts) != 0 {
+		t.Errorf("Verify reported %v, want every deadline read on the calendar it names", drifts)
+	}
+
+	stale := fold(t, head(config(10, RetestRestart)), revise(revised), deliver(t, "m2", deliveredAt, 10))
+	if len(stale.Refused) != 1 {
+		t.Fatalf("the fold refused %v, want the delivery on the superseded calendar", stale.Refused)
+	}
+	if !strings.Contains(stale.Refused[0].Msg, "superseded") {
+		t.Errorf("message %q should say the revision superseded that calendar", stale.Refused[0].Msg)
+	}
+}
+
+func TestAReplayReportsADriftedDeadlineAndKeepsTheRecordedOne(t *testing.T) {
+	good := deliver(t, "m2", deliveredAt, 10)
+	cases := []struct {
+		name  string
+		ev    step
+		want  string
+		cause Cause
+	}{
+		{"an hour off, as another zone database reads the close", offsetBy(t, good, time.Hour), "2026-03-16T17:00:00Z", CauseTzdata},
+		{"a day off, which the calendar does not fix at all", offsetBy(t, good, 24*time.Hour), "2026-03-17T16:00:00Z", CauseCalendar},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := fold(t, head(config(10, RetestRestart)), c.ev)
+			if len(got.Refused) != 0 {
+				t.Fatalf("the fold refused %v, want the recorded deadline taken as it stands", got.Refused)
+			}
+			w, open := milestoneOf(t, got, "m2").Open()
+			if !open {
+				t.Fatal("the delivery opened no acceptance window")
+			}
+			if stamp := w.Deadline.Format(time.RFC3339); stamp != c.want {
+				t.Errorf("the fold uses deadline %s, want the recorded %s", stamp, c.want)
+			}
+			drifts := driftsOf(t, got)
+			if len(drifts) != 1 {
+				t.Fatalf("Verify reported %v, want the one drifted deadline", drifts)
+			}
+			d := drifts[0]
+			if d.Seq != 2 || d.Milestone != "m2" || d.Cause != c.cause {
+				t.Errorf("drift = %+v, want the delivery at seq 2 of m2 caused by %s", d, c.cause)
+			}
+			if stamp := d.Recorded.Format(time.RFC3339); stamp != c.want {
+				t.Errorf("drift records %s, want %s", stamp, c.want)
+			}
+			if stamp := d.Recomputed.Format(time.RFC3339); stamp != wantDeadline {
+				t.Errorf("drift recomputes %s, want %s", stamp, wantDeadline)
+			}
+			if !strings.Contains(d.String(), string(c.cause)) {
+				t.Errorf("drift reads %q, should name its cause", d)
+			}
+			if err := got.Deem("m2", w.Deadline); err == nil {
+				t.Error("Deem closed the window on the deadline a replay recomputed, not the recorded one")
+			}
+		})
+	}
+}
+
+func TestACalendarRevisionTheFoldWillNotApply(t *testing.T) {
+	cases := []struct {
+		name  string
+		h     map[string]any
+		steps []step
+		want  string
+	}{
+		{"a revision carrying no calendar", head(nil), []step{{EventRevised, map[string]any{}}}, "no calendar object"},
+		{
+			"a revision into an unknown zone", head(nil),
+			[]step{{EventRevised, map[string]any{"calendar": map[string]any{"version": "2026.2", "zone": "Mars/Olympus"}}}},
+			"zoneinfo",
+		},
+		{"a revision to the calendar already in force", head(nil), []step{revise(cal)}, "again"},
+		{"a revision under a contract that opened on no calendar", headOn(nil, nil), []step{revise(cal)}, "opened on none"},
+		{"a revision back to an earlier version", head(nil), []step{revise(newCalendar("2026-03-16")), revise(cal)}, "again"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := fold(t, c.h, c.steps...)
+			if len(got.Refused) != 1 {
+				t.Fatalf("the fold refused %v, want exactly the last revision", got.Refused)
+			}
+			r := got.Refused[0]
+			if r.Seq != int64(len(c.steps))+1 || r.Type != EventRevised {
+				t.Errorf("refusal = %+v, want the revision at seq %d", r, len(c.steps)+1)
+			}
+			if !strings.Contains(r.Msg, c.want) {
+				t.Errorf("message %q should mention %q", r.Msg, c.want)
 			}
 		})
 	}
@@ -384,6 +544,9 @@ func TestAValidRejectionClosesTheWindowAndARetestOpensANewOne(t *testing.T) {
 	if !retest.Deadline.After(first.Deadline) {
 		t.Errorf("the retest runs to %s, want an instant after the first deadline %s", retest.Deadline, first.Deadline)
 	}
+	if drifts := driftsOf(t, got); len(drifts) != 0 {
+		t.Errorf("Verify reported %v, want both deadlines read back as their calendar fixes them", drifts)
+	}
 }
 
 func TestAResumedRetestCarriesTheRemainingDays(t *testing.T) {
@@ -398,33 +561,47 @@ func TestAResumedRetestCarriesTheRemainingDays(t *testing.T) {
 	if !open {
 		t.Fatal("the retest opened no acceptance window")
 	}
-	if !w.Retest || w.Days != 6 || w.Deadline.IsZero() {
+	if !w.Retest || w.Days != 6 || w.Deadline.Format(time.RFC3339) != "2026-03-16T16:00:00Z" {
 		t.Errorf("retest window = %+v, want the six days the first one had left", w)
+	}
+	if drifts := driftsOf(t, got); len(drifts) != 0 {
+		t.Errorf("Verify reported %v on a resumed retest counted on its own term", drifts)
 	}
 
 	full := fold(t, head(config(10, RetestResume)),
 		deliver(t, "m2", deliveredAt, 10),
 		rejectAfter("m2", 4, defect("c2", "the API answers 500 on an empty cart")),
 		deliver(t, "m2", "2026-03-06 09:00", 10))
-	if len(full.Refused) != 1 {
-		t.Fatalf("the fold refused %v, want the retest counted on the full term", full.Refused)
+	if len(full.Refused) != 0 {
+		t.Fatalf("the fold refused %v, want the recorded deadline taken as it stands", full.Refused)
 	}
-	if !strings.Contains(full.Refused[0].Msg, "6-business-day window") {
-		t.Errorf("message %q should say the resumed window runs six business days", full.Refused[0].Msg)
+	over, open := milestoneOf(t, full, "m2").Open()
+	if !open {
+		t.Fatal("the retest opened no acceptance window")
+	}
+	if stamp := over.Deadline.Format(time.RFC3339); stamp != "2026-03-20T16:00:00Z" {
+		t.Errorf("the fold uses deadline %s, want the one the retest recorded", stamp)
+	}
+	drifts := driftsOf(t, full)
+	if len(drifts) != 1 || drifts[0].Seq != 4 || drifts[0].Cause != CauseCalendar {
+		t.Fatalf("Verify reported %v, want the retest recomputed on the six days it resumes", drifts)
+	}
+	if stamp := drifts[0].Recomputed.Format(time.RFC3339); stamp != "2026-03-16T16:00:00Z" {
+		t.Errorf("drift recomputes %s, want the close of the sixth business day", stamp)
 	}
 
 	spent := fold(t, head(config(10, RetestResume)),
 		deliver(t, "m1", deliveredAt, 10),
 		rejectAfter("m1", 12, defect("c1", "the discovery report is missing")),
 		deliver(t, "m1", "2026-03-06 09:00", 0))
-	over, open := milestoneOf(t, spent, "m1").Open()
+	spentWindow, open := milestoneOf(t, spent, "m1").Open()
 	if !open {
 		t.Fatal("the retest opened no acceptance window")
 	}
-	if over.Days != 0 {
-		t.Errorf("a retest after a window spent over runs %d days, want 0", over.Days)
+	if spentWindow.Days != 0 {
+		t.Errorf("a retest after a window spent over runs %d days, want 0", spentWindow.Days)
 	}
-	if stamp := over.Deadline.Format(time.RFC3339); stamp != "2026-03-06T16:00:00Z" {
+	if stamp := spentWindow.Deadline.Format(time.RFC3339); stamp != "2026-03-06T16:00:00Z" {
 		t.Errorf("a retest of no days runs to %s, want the close of the delivery day", stamp)
 	}
 }
@@ -465,6 +642,9 @@ func TestDeemClosesAWindowOnceItsDeadlineHasPassed(t *testing.T) {
 	}
 	if err := undated.Deem("m2", past); err == nil {
 		t.Error("Deem ran on a delivery that fixed no deadline")
+	}
+	if drifts := driftsOf(t, undated); len(drifts) != 0 {
+		t.Errorf("Verify reported %v on a journal that fixed no deadline", drifts)
 	}
 }
 
@@ -529,18 +709,23 @@ func TestFoldRefusesABadHeadAndEverythingAfterIt(t *testing.T) {
 	}
 	for name, h := range cases {
 		t.Run(name, func(t *testing.T) {
-			got := fold(t, h, bareDelivery("m1"))
-			if len(got.Refused) != 2 {
-				t.Fatalf("the fold refused %v, want the head and the delivery after it", got.Refused)
+			got := fold(t, h, bareDelivery("m1"), revise(cal))
+			if len(got.Refused) != 3 {
+				t.Fatalf("the fold refused %v, want the head and the two events after it", got.Refused)
 			}
 			if got.Refused[0].Seq != 1 || got.Refused[0].Type != EventOpened {
 				t.Errorf("first refusal = %+v, want the head at seq 1", got.Refused[0])
 			}
-			if !strings.Contains(got.Refused[1].Msg, "before contract.opened") {
-				t.Errorf("message %q should say the event arrives before contract.opened", got.Refused[1].Msg)
+			for _, r := range got.Refused[1:] {
+				if !strings.Contains(r.Msg, "before contract.opened") {
+					t.Errorf("message %q should say the event arrives before contract.opened", r.Msg)
+				}
 			}
 			if len(got.Milestones) != 0 {
 				t.Errorf("a refused head left milestones %+v", got.Milestones)
+			}
+			if len(got.Calendars) != 0 {
+				t.Errorf("a refused head left calendar versions %+v", got.Calendars)
 			}
 		})
 	}
