@@ -18,6 +18,11 @@
 // delivery naming a calendar the journal never appended, or one a revision
 // superseded, is refused. Deem closes a window once the recorded instant has
 // passed.
+//
+// A hold pauses the clock of one milestone between the dates it covers, and
+// only approvals from both parties make it effective; the deadline it moves
+// the window to is recorded once by deadline.extended and read back on replay
+// like a delivery deadline.
 package acceptance
 
 import (
@@ -29,6 +34,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/polycratia/engageledger/approval"
 	"github.com/polycratia/engageledger/bizday"
 	"github.com/polycratia/engageledger/journal"
 )
@@ -36,11 +42,14 @@ import (
 // Event types the acceptance fold reads. An event of any other type passes
 // through.
 const (
-	EventOpened    = "contract.opened"
-	EventRevised   = "calendar.revised"
-	EventDelivered = "milestone.delivered"
-	EventAccepted  = "milestone.accepted"
-	EventRejected  = "milestone.rejected"
+	EventOpened       = "contract.opened"
+	EventRevised      = "calendar.revised"
+	EventDelivered    = "milestone.delivered"
+	EventAccepted     = "milestone.accepted"
+	EventRejected     = "milestone.rejected"
+	EventHeld         = "hold.proposed"
+	EventHoldApproved = "hold.approved"
+	EventExtended     = "deadline.extended"
 )
 
 // Status is where the acceptance of one milestone stands. The zero Status is a
@@ -74,12 +83,15 @@ type Defect struct {
 // Window is one acceptance window: the delivery that opened it, the business
 // days it runs and what closed it. Delivered and Deadline are the UTC instants
 // the delivery arrived and the window runs out on, CalendarHash names the
-// calendar version they were computed on, Used is the days the clock had
-// counted when a rejection closed it, and ClosedBy is the event that closed it.
+// calendar version they were computed on, Held is the business days the
+// effective holds of this window paused the clock for, Used is the days the
+// clock had counted when a rejection closed it, and ClosedBy is the event that
+// closed it.
 type Window struct {
 	Seq          int64
 	Days         int64
 	Used         int64
+	Held         int64
 	Retest       bool
 	Closed       bool
 	ClosedBy     int64
@@ -181,8 +193,9 @@ func (d Drift) String() string {
 
 // Acceptance is the acceptance state of the engagement. WindowDays and
 // RetestWindow are the acceptance config the contract head carries, Calendars
-// are the calendar versions the journal appended in order, and Calendar with
-// CalendarHash is the one the last of them put in force.
+// are the calendar versions the journal appended in order, Calendar with
+// CalendarHash is the one the last of them put in force, and Holds are the
+// holds the journal proposed, effective or not.
 type Acceptance struct {
 	WindowDays   int64
 	RetestWindow Retest
@@ -190,6 +203,7 @@ type Acceptance struct {
 	CalendarHash string
 	Calendars    []Version
 	Milestones   []Milestone
+	Holds        []Hold
 	Refused      []Refusal
 }
 
@@ -203,10 +217,12 @@ func (a Acceptance) Find(id string) (Milestone, bool) {
 }
 
 // Verify recomputes every recorded deadline with the calendar version whose
-// hash its delivery names and returns the ones that come out on another
+// hash its delivery names, over the term of the window and the business days
+// its effective holds paused, and returns the ones that come out on another
 // instant, in journal order. A drift is reported, never applied: the windows
-// keep the deadline their delivery recorded, so neither a revised calendar nor
-// an updated zone database moves a window that is already running.
+// keep the deadline their delivery and their extensions recorded, so neither a
+// revised calendar nor an updated zone database moves a window that is already
+// running.
 func (a Acceptance) Verify() ([]Drift, error) {
 	var drifts []Drift
 	for _, m := range a.Milestones {
@@ -219,7 +235,7 @@ func (a Acceptance) Verify() ([]Drift, error) {
 				return nil, fmt.Errorf("acceptance: delivery %d of milestone %q names calendar %s, which the journal does not carry",
 					w.Seq, m.ID, short(w.CalendarHash))
 			}
-			want, err := v.Calendar.Deadline(w.Delivered, w.Days)
+			want, err := v.Calendar.Deadline(w.Delivered, w.Days+w.Held)
 			if err != nil {
 				return nil, fmt.Errorf("acceptance: recomputing the deadline of delivery %d of milestone %q: %w", w.Seq, m.ID, err)
 			}
@@ -251,10 +267,10 @@ func causeOf(cal bizday.Calendar, recorded, recomputed time.Time) Cause {
 }
 
 // Deem moves a milestone to deemed_accepted because the acceptance window its
-// delivery opened has run out: the deadline that delivery recorded is before
-// at. It refuses a milestone the contract does not carry, one with no open
-// window, a window whose delivery fixed no deadline, and a deadline that has
-// not passed yet.
+// delivery opened has run out: the deadline the journal recorded for it is
+// before at. It refuses a milestone the contract does not carry, one with no
+// open window, a window whose delivery fixed no deadline, and a deadline that
+// has not passed yet.
 func (a *Acceptance) Deem(id string, at time.Time) error {
 	i := indexOf(a.Milestones, id)
 	if i < 0 {
@@ -335,6 +351,7 @@ func Fold(events []journal.Event) Acceptance {
 		RetestWindow: f.retest,
 		Calendars:    f.calendars,
 		Milestones:   f.milestones,
+		Holds:        f.holds,
 		Refused:      f.refused,
 	}
 	if head, ok := f.head(); ok {
@@ -347,8 +364,12 @@ type folder struct {
 	opened     bool
 	window     int64
 	retest     Retest
+	parties    []string
+	keys       approval.Keys
 	calendars  []Version
 	milestones []Milestone
+	holds      []Hold
+	proposals  map[string]map[string]any
 	refused    []Refusal
 }
 
@@ -364,15 +385,18 @@ func (f *folder) apply(e journal.Event) error {
 	switch e.Type {
 	case EventOpened:
 		return f.open(e)
-	case EventRevised, EventDelivered, EventAccepted, EventRejected:
+	case EventRevised, EventDelivered, EventAccepted, EventRejected, EventHeld, EventHoldApproved, EventExtended:
 	default:
 		return nil
 	}
 	if !f.opened {
 		return errors.New("arrives before contract.opened")
 	}
-	if e.Type == EventRevised {
+	switch e.Type {
+	case EventRevised:
 		return f.revise(e)
+	case EventHoldApproved:
+		return f.approveHold(e)
 	}
 	i, err := f.locate(e)
 	if err != nil {
@@ -383,6 +407,10 @@ func (f *folder) apply(e journal.Event) error {
 		return f.deliver(e, i)
 	case EventAccepted:
 		return f.accept(e, i)
+	case EventHeld:
+		return f.hold(e, i)
+	case EventExtended:
+		return f.extend(e, i)
 	}
 	return f.reject(e, i)
 }
@@ -399,6 +427,14 @@ func (f *folder) open(e journal.Event) error {
 	if err != nil {
 		return err
 	}
+	parties, err := readParties(e.Body)
+	if err != nil {
+		return err
+	}
+	keys, err := approval.ReadKeys(e.Body)
+	if err != nil {
+		return err
+	}
 	var calendars []Version
 	if _, ok := e.Body["calendar"]; ok {
 		v, err := readVersion(e)
@@ -411,6 +447,7 @@ func (f *folder) open(e journal.Event) error {
 	}
 	f.opened, f.milestones = true, milestones
 	f.window, f.retest = window, retest
+	f.parties, f.keys = parties, keys
 	f.calendars = calendars
 	return nil
 }
@@ -419,8 +456,7 @@ func (f *folder) open(e journal.Event) error {
 // stay in the fold: the deadlines they fixed are the ones their windows keep,
 // and a replay reads them back on the version their delivery named.
 func (f *folder) revise(e journal.Event) error {
-	head, ok := f.head()
-	if !ok {
+	if _, ok := f.head(); !ok {
 		return errors.New("revises the calendar of a contract that opened on none")
 	}
 	v, err := readVersion(e)
@@ -430,7 +466,6 @@ func (f *folder) revise(e journal.Event) error {
 	if seen, ok := versionOf(f.calendars, v.Hash); ok {
 		return fmt.Errorf("appends calendar %s again, which event %d already carries", short(v.Hash), seen.Seq)
 	}
-	_ = head
 	f.calendars = append(f.calendars, v)
 	return nil
 }
