@@ -9,10 +9,12 @@
 // kept outside the journal, which is weaker because nothing here ties it to
 // the body it approves. Every effective change order reports the strength of
 // its evidence, and the terms carry the money that rests on weak evidence
-// alone. Fold names the first event it refuses: a change order naming a
-// milestone the contract does not carry, one priced in another currency, one
-// that removes or reprices an accepted milestone, a second decision on a
-// settled change order, or an approval whose evidence does not hold.
+// alone. An op that moves no money here, the set_nte_cap op package nte folds,
+// is listed on its change order and leaves the terms alone. Fold names the
+// first event it refuses: a change order naming a milestone the contract does
+// not carry, one priced in another currency, one that removes or reprices an
+// accepted milestone, a second decision on a settled change order, or an
+// approval whose evidence does not hold.
 package terms
 
 import (
@@ -71,6 +73,9 @@ const (
 	OpRemove  OpKind = "remove"
 	OpReprice OpKind = "reprice"
 	OpSetCap  OpKind = "set_cap"
+	// OpSetNTECap raises the not-to-exceed cap in minutes, which package nte
+	// folds. It moves no money, so the terms carry it and stay as they were.
+	OpSetNTECap OpKind = "set_nte_cap"
 )
 
 // Parties are the two signatures the engagement needs.
@@ -552,6 +557,8 @@ func readOp(v any) (Op, error) {
 		if op.Criteria, err = readCriteria(obj["criteria"]); err != nil {
 			return Op{}, err
 		}
+	case OpSetNTECap:
+		return op, nil
 	case OpRemove, OpReprice, OpSetCap:
 	default:
 		return Op{}, fmt.Errorf("names an unknown op %q", kind)
