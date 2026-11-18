@@ -1,0 +1,4 @@
+{"amount":100000,"currency":"EUR","kind":"milestone","milestone":"m1"}
+{"amount":200000,"currency":"EUR","kind":"milestone","milestone":"m2"}
+{"amount":96000,"currency":"EUR","kind":"time","minutes":960,"month":"2026-04","rate_minor_per_hour":6000}
+{"amount":24000,"currency":"EUR","kind":"time","minutes":240,"month":"2026-05","rate_minor_per_hour":6000}
